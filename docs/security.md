@@ -1,0 +1,5 @@
+# Security notes
+**Threat model:** a local, single-user lab tool. The API binds to 127.0.0.1 and has **no authentication** — do not expose it.
+**Controls:** predefined workloads only (argv arrays, no shell); Pydantic range limits on every parameter; hostname and cgroup-path validation in C; hard caps in workloads (≤512 MiB, ≤64 procs, ≤120 s); launcher timeout; 1 MB log cap (workload killed beyond it); scrubbed environment (`PATH` only); PID+starttime verification before signalling; cgroup created per container and removed on failure/removal.
+**Prefer rootless:** run with `scripts/run-with-delegation.sh` (user namespace + systemd-delegated cgroup). Do not run the backend as root.
+**Residual risks / limits:** namespaces are not a complete sandbox. The mount namespace only isolates mounts (private `/proc`); the workload still sees the host filesystem (the shipped workloads do not write to it). No seccomp, capability dropping beyond the user namespace, or LSM profile. Shared kernel ⇒ kernel bugs apply. Network namespace is empty by default. Container-escape techniques are intentionally out of scope.

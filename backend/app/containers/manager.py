@@ -1,5 +1,6 @@
 from __future__ import annotations
 """Container lifecycle. The DB is metadata; liveness is always verified against /proc (pid + starttime)."""
+import errno
 import json
 import os
 import select
@@ -14,8 +15,10 @@ from typing import Optional
 
 from app.containers.states import REMOVABLE, State, can_transition
 from app.core import config
-from app.core.errors import InvalidTransition, LaunchFailed, NotFound, Unsupported
+from app.core.errors import InvalidTransition, LaunchFailed, NotFound, PermissionDenied, Unsupported
 from app.core.models import ContainerCreate, Limits, WorkloadSpec
+
+SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
 from app.database.db import Database
 from app.isolation import capabilities
 from app.monitoring import metrics
@@ -73,10 +76,18 @@ class ContainerManager:
             if self._pid_alive(r):
                 self.db.event("reconcile", "orphan_running", r["id"], host_pid=r["host_pid"])
                 continue      # still genuinely alive; stop() can kill it (pid+starttime verified)
+            cg = self._cg(r)
+            if cg and Path(cg.path).exists():
+                try:
+                    cg.kill_all()
+                except Exception:
+                    pass
             self.db.execute("UPDATE containers SET state='FAILED', host_pid=NULL WHERE id=?", (r["id"],))
-            self.db.execute("UPDATE workloads SET ended_at=?, termination_reason='lost_on_restart' "
+            self.db.execute("UPDATE workloads SET ended_at=?, exit_code=1, termination_reason='lost_on_restart' "
                             "WHERE container_id=? AND ended_at IS NULL", (time.time(), r["id"]))
             self.db.event("reconcile", "marked_failed_stale_process", r["id"])
+        self.db.execute("UPDATE workloads SET ended_at=?, exit_code=1, termination_reason='lost_on_restart' "
+                        "WHERE ended_at IS NULL", (time.time(),))
 
     # ---------- operations ----------
     def create(self, req: ContainerCreate) -> dict:
@@ -130,7 +141,16 @@ class ContainerManager:
         if not config.CRIS_RUN.exists():
             self._set_state(cid, State.FAILED)
             raise LaunchFailed("native binaries missing: run `make native`")
+
         ns = json.loads(row["ns_json"])
+        ok, msg, errcode = capabilities.validate_requested_namespaces(ns)
+        if not ok:
+            self._set_state(cid, State.FAILED)
+            self.db.event("start", "failed_unsupported", cid, reason=msg, errno=errcode)
+            if errcode in (errno.EPERM, errno.EACCES):
+                raise PermissionDenied(f"Permission denied creating requested namespaces: {msg}", namespaces=ns, errno=errcode)
+            raise Unsupported(f"Requested namespace configuration is not supported on this host: {msg}", namespaces=ns, errno=errcode)
+
         nsarg = ",".join(k for k in ("pid", "mnt", "uts", "ipc", "net", "user") if ns.get(k))
         cg = self._cg(row)
         base = cg.stats() if cg else {}
@@ -151,13 +171,47 @@ class ContainerManager:
             self.db.event("start", "failed", cid, error=str(e))
             raise LaunchFailed(str(e))
         os.close(w_fd)
-        started = self._read_event(r_fd, "started", config.START_TIMEOUT_S)
+
+        started, events = self._read_startup(r_fd, proc, config.START_TIMEOUT_S)
         if not started:
-            err = self._drain(r_fd)
-            proc.kill(); proc.wait(); log.close(); os.close(r_fd)
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+            log.close()
+            try:
+                os.close(r_fd)
+            except OSError:
+                pass
+            if cg and Path(cg.path).exists():
+                cg.kill_all()
             self._set_state(cid, State.FAILED)
-            self.db.event("start", "failed", cid, events=err)
-            raise LaunchFailed("launcher did not report a started event", events=err)
+
+            err_ev = next((e for e in events if e.get("event") == "error"), None)
+            err_num = err_ev.get("errno") if err_ev else None
+            stage = err_ev.get("stage", "launcher") if err_ev else "startup"
+            err_msg = (err_ev.get("msg") or err_ev.get("error") or err_ev.get("what")) if err_ev else None
+
+            if err_msg:
+                detail_msg = f"Native launcher failed at stage '{stage}': {err_msg}"
+            elif proc.returncode is not None and proc.returncode != 0:
+                try:
+                    log_tail = (config.LOG_DIR / f"{cid}.log").read_text(errors="replace")[-500:].strip()
+                except Exception:
+                    log_tail = ""
+                detail_msg = f"Native launcher exited with code {proc.returncode}" + (f": {log_tail}" if log_tail else "")
+            else:
+                detail_msg = f"Native launcher did not report a started event within {config.START_TIMEOUT_S}s"
+
+            self.db.event("start", "failed", cid, events=events, reason=detail_msg, errno=err_num, stage=stage)
+
+            if err_num in (errno.EPERM, errno.EACCES):
+                raise PermissionDenied(detail_msg, events=events, stage=stage, errno=err_num)
+            elif err_num in (errno.ENOSYS, errno.EINVAL):
+                raise Unsupported(detail_msg, events=events, stage=stage, errno=err_num)
+            raise LaunchFailed(detail_msg, events=events, stage=stage, errno=err_num)
+
         pid = started["host_pid"]
         wid = self.db.execute(
             "INSERT INTO workloads(container_id,type,params_json,limits_json,started_at,host_pid) VALUES(?,?,?,?,?,?)",
@@ -170,18 +224,81 @@ class ContainerManager:
         return self.get(cid)
 
     @staticmethod
+    def _read_startup(fd: int, proc: Popen, timeout: float) -> tuple[Optional[dict], list[dict]]:
+        end = time.time() + timeout
+        buf = b""
+        events: list[dict] = []
+        started: Optional[dict] = None
+
+        while time.time() < end:
+            ready, _, _ = select.select([fd], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line.decode("utf-8", errors="replace"))
+                        events.append(ev)
+                        if ev.get("event") == "started":
+                            started = ev
+                            return started, events
+                        if ev.get("event") == "error":
+                            return None, events
+                    except Exception:
+                        continue
+
+            if proc.poll() is not None:
+                try:
+                    while True:
+                        r, _, _ = select.select([fd], [], [], 0.05)
+                        if not r:
+                            break
+                        c = os.read(fd, 4096)
+                        if not c:
+                            break
+                        buf += c
+                except OSError:
+                    pass
+                for ln in buf.splitlines():
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        ev = json.loads(ln.decode("utf-8", errors="replace"))
+                        events.append(ev)
+                        if ev.get("event") == "started":
+                            started = ev
+                    except Exception:
+                        continue
+                break
+
+        return started, events
+
+    @staticmethod
     def _read_event(fd: int, name: str, timeout: float) -> Optional[dict]:
         end, buf = time.time() + timeout, b""
         while time.time() < end:
             ready, _, _ = select.select([fd], [], [], 0.1)
             if ready:
-                chunk = os.read(fd, 4096)
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    return None
                 if not chunk:
                     return None
                 buf += chunk
                 for line in buf.splitlines():
                     try:
-                        ev = json.loads(line)
+                        ev = json.loads(line.decode("utf-8", errors="replace"))
                     except ValueError:
                         continue
                     if ev.get("event") == name:
@@ -195,7 +312,7 @@ class ContainerManager:
         out = b""
         try:
             while True:
-                r, _, _ = select.select([fd], [], [], 0.2)
+                r, _, _ = select.select([fd], [], [], 0.1)
                 if not r:
                     break
                 c = os.read(fd, 4096)
@@ -206,9 +323,12 @@ class ContainerManager:
             pass
         evs = []
         for ln in out.splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
             try:
-                evs.append(json.loads(ln))
-            except ValueError:
+                evs.append(json.loads(ln.decode("utf-8", errors="replace")))
+            except Exception:
                 pass
         return evs
 
@@ -296,12 +416,23 @@ class ContainerManager:
         if cg and Path(cg.path).exists():
             cg.kill_all()
         try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except OSError:
+            os.killpg(os.getpgid(pid), SIGKILL)
+        except (OSError, AttributeError):
             pass
 
     def stop(self, cid: str) -> dict:
         row = self._row(cid)
+        cur = State(row["state"])
+        if cur == State.STOPPED:
+            return self.get(cid)
+        if cur in (State.CREATED, State.FAILED) and not self._pid_alive(row):
+            return self.get(cid)
+        if cur == State.STOPPING:
+            t = self._threads.get(cid)
+            if t:
+                t.join(10)
+            return self.get(cid)
+
         self._set_state(cid, State.STOPPING)
         self._stop_req.add(cid)
         cg = self._cg(row)
@@ -309,7 +440,7 @@ class ContainerManager:
         if pid and self._pid_alive(row):
             for p in (pid,):
                 try:
-                    os.kill(p, signal.SIGKILL)         # ns init (or workload) dies => PID ns torn down
+                    os.kill(p, SIGKILL)         # ns init (or workload) dies => PID ns torn down
                 except OSError:
                     pass
         if cg and Path(cg.path).exists():

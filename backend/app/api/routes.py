@@ -149,18 +149,18 @@ def exp_results(eid: str):
 # ---- OS laboratory (all simulations; responses carry is_simulation=true unless real threads are used) ----
 class SchedReq(BaseModel):
     algorithm: str
-    processes: list[dict]
+    processes: list[dict] = Field(..., min_length=1)
     quantum: int = Field(2, ge=1)
 
 
 class PageReq(BaseModel):
     algorithm: str
-    references: list[int]
+    references: list[int] = Field(..., min_length=1)
     frames: int = Field(3, ge=1, le=64)
 
 
 class TransReq(BaseModel):
-    addresses: list[int]
+    addresses: list[int] = Field(..., min_length=1)
     page_size: int = 1024
     page_table: dict[int, int]
     tlb_size: int = 0
@@ -182,7 +182,7 @@ class DetectReq(BaseModel):
 
 class DiskReq(BaseModel):
     algorithm: str
-    requests: list[int]
+    requests: list[int] = Field(..., min_length=1)
     head: int
     disk_size: int = 200
     direction: str = "up"

@@ -21,7 +21,10 @@ def own_cgroup() -> Optional[Path]:
     try:
         for line in Path("/proc/self/cgroup").read_text().splitlines():
             if line.startswith("0::"):
-                return CGROUP_ROOT / line[3:].lstrip("/")
+                path = CGROUP_ROOT / line[3:].lstrip("/")
+                if path.name == "_cris_manager":
+                    return path.parent
+                return path
     except OSError:
         pass
     return None
@@ -87,7 +90,7 @@ def prepare_base(base: Path) -> str:
                 try:
                     (mgr / "cgroup.procs").write_text(str(os.getpid()))
                 except OSError as e:
-                    msg = f"could not move manager process out of {base}: {e.strerror}"
+                    return f"could not move manager process out of {base}: {e}"
             avail = (_read(base / "cgroup.controllers") or "").split()
             enable = " ".join(f"+{c}" for c in WANTED if c in avail)
             if enable:
@@ -108,6 +111,8 @@ class Cgroup:
         if base is None:
             raise Unsupported("cgroup v2 resource control unavailable: " + reason)
         prepare_base(base)
+        if status != "ok":
+            raise Unsupported(f"cgroup setup failed: {status}")
         p = base / f"cris-{name}"
         p.mkdir(exist_ok=False)
         return cls(p)
@@ -136,7 +141,22 @@ class Cgroup:
                 (self.path / "pids.max").write_text(str(lim.pids_max))
         except OSError as e:
             raise Unsupported(f"kernel rejected cgroup limit: {e.strerror}", errno=e.errno)
-        return self.effective()
+
+        eff = self.effective()
+        if lim.cpu_quota_percent is not None:
+            eff_cpu = eff.get("cpu_quota_percent")
+            if eff_cpu is None or abs(eff_cpu - lim.cpu_quota_percent) > 1.0:
+                raise Unsupported(f"kernel did not confirm CPU quota: requested {lim.cpu_quota_percent}%, effective is {eff_cpu}%")
+        if lim.memory_mb is not None:
+            eff_mem = eff.get("memory_mb")
+            if eff_mem is None or eff_mem != lim.memory_mb:
+                raise Unsupported(f"kernel did not confirm memory limit: requested {lim.memory_mb} MiB, effective is {eff_mem} MiB")
+        if lim.pids_max is not None:
+            eff_pids = eff.get("pids_max")
+            if eff_pids is None or eff_pids != lim.pids_max:
+                raise Unsupported(f"kernel did not confirm pids limit: requested {lim.pids_max}, effective is {eff_pids}")
+
+        return eff
 
     @staticmethod
     def _need(c: str, have: list[str]) -> None:
@@ -175,9 +195,10 @@ class Cgroup:
             except OSError:
                 pass
         import signal
+        sig = getattr(signal, "SIGKILL", signal.SIGTERM)
         for pid in self.pids():
             try:
-                os.kill(pid, signal.SIGKILL)
+                os.kill(pid, sig)
             except OSError:
                 pass
 

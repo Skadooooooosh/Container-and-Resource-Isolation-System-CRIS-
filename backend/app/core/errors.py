@@ -23,5 +23,9 @@ class ValidationFailed(CrisError):
     status, code = 422, "validation_error"
 
 
+class PermissionDenied(CrisError):
+    status, code = 403, "permission_denied"
+
+
 class LaunchFailed(CrisError):
     status, code = 500, "launch_failed"

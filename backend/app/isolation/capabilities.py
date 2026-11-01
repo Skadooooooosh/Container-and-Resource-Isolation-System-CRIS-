@@ -53,11 +53,21 @@ def detect(force: bool = False) -> dict:
     for ns in ("user", "pid", "mnt", "uts", "ipc", "net"):
         if probe is None:
             feats.append(_f(f"ns.{ns}", f"{ns.upper()} namespace", "unknown", "native probe unavailable"))
-        elif probe[ns] == 0:
+        elif probe.get(ns) == 0:
             feats.append(_f(f"ns.{ns}", f"{ns.upper()} namespace", "active", "clone(2) succeeded"))
         else:
             s, d = _errno_status(probe[ns])
             feats.append(_f(f"ns.{ns}", f"{ns.upper()} namespace", s, d))
+
+    for c_key, c_name in (("combined_default", "Combined namespaces (PID+MNT+UTS+IPC)"),
+                          ("combined_all", "Combined namespaces (All: PID+MNT+UTS+IPC+NET)")):
+        if probe is None or c_key not in probe:
+            feats.append(_f(f"ns.{c_key}", c_name, "unknown", "probe unavailable"))
+        elif probe[c_key] == 0:
+            feats.append(_f(f"ns.{c_key}", c_name, "active", "clone(2) combined succeeded"))
+        else:
+            s, d = _errno_status(probe[c_key])
+            feats.append(_f(f"ns.{c_key}", c_name, s, f"combined creation failed: {d}"))
     if not cgroups.v2_mounted():
         feats.append(_f("cgroup.v2", "cgroup v2", "unsupported", "no unified hierarchy at /sys/fs/cgroup"))
         for c in ("cpu", "memory", "pids", "io"):
@@ -94,3 +104,46 @@ def status_of(feature_id: str) -> str:
         if f["id"] == feature_id:
             return f["status"]
     return "unknown"
+
+
+def get_raw_probe() -> Optional[dict]:
+    if platform.system() != "Linux" or not CRIS_RUN.exists():
+        return None
+    try:
+        res = subprocess.run([str(CRIS_RUN), "--probe"], capture_output=True, text=True, timeout=10)
+        return json.loads(res.stdout)
+    except Exception:
+        return None
+
+
+def validate_requested_namespaces(ns: dict) -> tuple[bool, str, Optional[int]]:
+    """Verify that requested namespaces and their combination can actually be created on this host."""
+    if platform.system() != "Linux":
+        return False, "Namespace isolation requires a Linux kernel (use WSL2 or a Linux VM)", errno.ENOSYS
+    if not CRIS_RUN.exists():
+        return True, "native binaries not built", None
+
+    probe = get_raw_probe()
+    if not probe:
+        return True, "probe unavailable", None
+
+    # Check individual requested namespaces
+    for k in ("pid", "mnt", "uts", "ipc", "net", "user"):
+        if ns.get(k) and probe.get(k, 0) != 0:
+            err = probe[k]
+            st, desc = _errno_status(err)
+            return False, f"{k.upper()} namespace is {st}: {desc}", err
+
+    # Check combined namespaces if multiple are requested
+    count = sum(bool(ns.get(k)) for k in ("pid", "mnt", "uts", "ipc", "net"))
+    if count > 1:
+        has_net = bool(ns.get("net"))
+        comb_key = "combined_all" if has_net else "combined_default"
+        if comb_key in probe and probe[comb_key] != 0:
+            err = probe[comb_key]
+            st, desc = _errno_status(err)
+            actionable = "run as root (or configure unprivileged user namespaces sysctl/AppArmor)" if err in (errno.EPERM, errno.EACCES) else desc
+            return False, f"Combined namespace creation ({comb_key}) is {st}: {actionable}", err
+
+    return True, "ok", None
+

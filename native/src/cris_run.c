@@ -92,13 +92,16 @@ static int child_fn(void *arg) {
     _exit(WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st));
 }
 
-static int probe_child(void *a) { (void)a; return 0; }
+static int probe_child(void *arg) {
+    (void)arg;
+    return 0;
+}
 
-static int probe_one(int flag) {
+static int probe_flags(int flags) {
     char *stk = malloc(STACK_SIZE);
     if (!stk) return ENOMEM;
-    int f = flag | SIGCHLD;
-    if (!(flag & CLONE_NEWUSER) && geteuid() != 0) f |= CLONE_NEWUSER;
+    int f = flags | SIGCHLD;
+    if (!(flags & CLONE_NEWUSER) && geteuid() != 0) f |= CLONE_NEWUSER;
     pid_t p = clone(probe_child, stk + STACK_SIZE, f, NULL);
     int e = 0;
     if (p < 0) e = errno; else waitpid(p, NULL, 0);
@@ -106,10 +109,17 @@ static int probe_one(int flag) {
     return e;
 }
 
+static int probe_one(int flag) {
+    return probe_flags(flag);
+}
+
 static int do_probe(void) {
-    printf("{\"euid\":%d,\"user\":%d,\"pid\":%d,\"mnt\":%d,\"uts\":%d,\"ipc\":%d,\"net\":%d}\n",
+    int comb_def = probe_flags(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC);
+    int comb_all = probe_flags(CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET);
+    printf("{\"euid\":%d,\"user\":%d,\"pid\":%d,\"mnt\":%d,\"uts\":%d,\"ipc\":%d,\"net\":%d,\"combined_default\":%d,\"combined_all\":%d}\n",
            (int)geteuid(), probe_one(CLONE_NEWUSER), probe_one(CLONE_NEWPID), probe_one(CLONE_NEWNS),
-           probe_one(CLONE_NEWUTS), probe_one(CLONE_NEWIPC), probe_one(CLONE_NEWNET));
+           probe_one(CLONE_NEWUTS), probe_one(CLONE_NEWIPC), probe_one(CLONE_NEWNET),
+           comb_def, comb_all);
     return 0;
 }
 
@@ -167,7 +177,7 @@ int main(int argc, char **argv) {
         snprintf(buf, sizeof buf, "0 %d 1", (int)geteuid());
         int r2 = write_file(path, buf);
         if (r1 || r2) {
-            emit(o.event_fd, "{\"event\":\"error\",\"stage\":\"uidmap\",\"errno\":%d}\n", errno);
+            emit(o.event_fd, "{\"event\":\"error\",\"stage\":\"uidmap\",\"errno\":%d,\"msg\":\"%s\"}\n", errno, strerror(errno));
             kill(child, SIGKILL); waitpid(child, NULL, 0); return 4;
         }
     }

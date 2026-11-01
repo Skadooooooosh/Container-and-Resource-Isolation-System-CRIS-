@@ -22,8 +22,12 @@ def own_cgroup() -> Optional[Path]:
         for line in Path("/proc/self/cgroup").read_text().splitlines():
             if line.startswith("0::"):
                 path = CGROUP_ROOT / line[3:].lstrip("/")
-                if path.name == "_cris_manager":
-                    return path.parent
+
+                # If the process is inside one or more manager
+                # cgroups, walk back to the original delegated base.
+                while path.name == "_cris_manager":
+                    path = path.parent
+
                 return path
     except OSError:
         pass
@@ -110,7 +114,7 @@ class Cgroup:
         base, reason = resolve_base()
         if base is None:
             raise Unsupported("cgroup v2 resource control unavailable: " + reason)
-        prepare_base(base)
+        status = prepare_base(base)
         if status != "ok":
             raise Unsupported(f"cgroup setup failed: {status}")
         p = base / f"cris-{name}"

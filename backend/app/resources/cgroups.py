@@ -8,7 +8,7 @@ from app.core.config import CGROUP_ROOT, CPU_PERIOD_US
 from app.core.errors import Unsupported
 from app.core.models import Limits
 
-WANTED = ("cpu", "memory", "pids")
+WANTED = ("cpu", "memory", "pids","io")
 _prep_lock = threading.Lock()
 _prep_state: dict = {}
 
